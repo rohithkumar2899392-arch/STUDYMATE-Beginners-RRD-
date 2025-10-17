@@ -1,0 +1,130 @@
+# ============================================================
+# 🧠 StudyMate: IBM Granite 3.3-2B PDF AI Study Assistant via API
+# ============================================================
+
+!pip install gradio PyMuPDF faiss-cpu sentence-transformers transformers huggingface_hub --quiet
+
+# ------------------------------
+# Imports
+# ------------------------------
+import fitz
+import gradio as gr
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from huggingface_hub import InferenceClient
+
+# ------------------------------
+# Hugging Face API Token
+# ------------------------------
+HF_TOKEN = "YOUR_HF_TOKEN_HERE"  # Replace with your Hugging Face token
+client = InferenceClient(HF_TOKEN)
+
+# ------------------------------
+# Load Embedding Model
+# ------------------------------
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# ------------------------------
+# PDF Text Extraction
+# ------------------------------
+def extract_text_from_pdfs(pdf_files):
+    text = ""
+    for pdf_path in pdf_files:
+        with fitz.open(pdf_path) as doc:
+            for page in doc:
+                text += page.get_text("text")
+    return text
+
+# ------------------------------
+# Chunk Text
+# ------------------------------
+def chunk_text(text, chunk_size=500):
+    sentences = text.split(". ")
+    chunks, temp = [], ""
+    for sentence in sentences:
+        if len(temp) + len(sentence) < chunk_size:
+            temp += sentence + ". "
+        else:
+            chunks.append(temp.strip())
+            temp = sentence + ". "
+    if temp:
+        chunks.append(temp.strip())
+    return chunks
+
+# ------------------------------
+# FAISS Index
+# ------------------------------
+def build_faiss_index(chunks):
+    embeddings = embedding_model.encode(chunks)
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(np.array(embeddings).astype("float32"))
+    return index, embeddings
+
+# ------------------------------
+# Retrieve Context
+# ------------------------------
+def retrieve_context(question, chunks, index, top_k=3):
+    query_embedding = embedding_model.encode([question])
+    distances, indices = index.search(np.array(query_embedding).astype("float32"), top_k)
+    return "\n".join([chunks[i] for i in indices[0]])
+
+# ------------------------------
+# Generate Answer using IBM Granite API
+# ------------------------------
+def generate_answer(context, question):
+    prompt = f"Use the following study material to answer the question clearly:\n\n{context}\n\nQuestion: {question}\nAnswer:"
+    result = client.text_generation(model="ibm-granite/granite-3.3-2b-instruct", inputs=prompt, parameters={"max_new_tokens":300, "temperature":0.7})
+    return result.generated_text.replace(prompt, "").strip()
+
+# ------------------------------
+# Chat Memory Logic
+# ------------------------------
+chat_history = []
+global_chunks = []
+global_index = None
+
+def study_chat(pdf_files, user_question):
+    global chat_history, global_chunks, global_index
+
+    # Process PDFs once
+    if pdf_files and not global_chunks:
+        pdf_paths = [f.name for f in pdf_files]
+        text = extract_text_from_pdfs(pdf_paths)
+        global_chunks = chunk_text(text)
+        global_index, _ = build_faiss_index(global_chunks)
+        chat_history.append(("🟢 System", "✅ PDFs processed! Start asking questions."))
+
+    if not global_index:
+        return chat_history + [("⚠️ System", "Upload PDFs first!")]
+
+    # Retrieve context & generate answer
+    context = retrieve_context(user_question, global_chunks, global_index)
+    answer = generate_answer(context, user_question)
+    chat_history.append(("🧑‍🎓 You", user_question))
+    chat_history.append(("🤖 StudyMate", answer))
+    return chat_history
+
+# ------------------------------
+# Gradio Chat Interface
+# ------------------------------
+with gr.Blocks() as interface:
+    gr.Markdown("# 📘 StudyMate - IBM Granite 3.3-2B PDF AI Study Assistant (API-based)")
+    gr.Markdown("Upload PDFs and ask questions. Powered by IBM Granite + FAISS embeddings.")
+
+    pdf_input = gr.File(label="📂 Upload PDF(s)", file_count="multiple", type="filepath")
+    chatbot = gr.Chatbot(label="Chat History", height=400)
+    question_box = gr.Textbox(label="💬 Ask your question")
+    ask_button = gr.Button("Ask ➜")
+
+    ask_button.click(
+        study_chat,
+        inputs=[pdf_input, question_box],
+        outputs=chatbot
+    )
+
+# ------------------------------
+# Launch App
+# ------------------------------
+interface.launch(share=True)
